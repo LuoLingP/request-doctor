@@ -1,0 +1,450 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { apply } from '../index.js';
+
+/**
+ * A minimal Cordis-shaped context: event buses, effects, optional services and
+ * the two service properties the plugin reads. `waterfall` mirrors the real
+ * dispatch (listeners run in order; a listener that returns a value wins).
+ */
+function fakeContext({ services = {}, logger = console } = {}) {
+  const listeners = new Map();
+  const disposers = [];
+  const emitted = [];
+  const appends = [];
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {}, ...logger },
+    on(event, listener, options) {
+      const list = listeners.get(event) ?? [];
+      list.push({ listener, options });
+      listeners.set(event, list);
+      return () => {};
+    },
+    emit(event, ...args) {
+      emitted.push({ event, args });
+      for (const { listener } of listeners.get(event) ?? []) listener(...args);
+    },
+    effect(factory, label) {
+      const dispose = factory();
+      if (typeof dispose === 'function') disposers.push({ dispose, label });
+      return dispose;
+    },
+    inject(names, callback) {
+      const present = {};
+      let missing = false;
+      for (const name of names) {
+        if (services[name] === undefined) missing = true;
+        else present[name] = services[name];
+      }
+      if (missing) return;
+      const child = { ...ctx, ...present, inject: () => {}, effect: ctx.effect, on: ctx.on };
+      const dispose = callback(child);
+      if (typeof dispose === 'function') disposers.push({ dispose, label: `inject:${names.join(',')}` });
+    },
+    get(name) {
+      return services[name];
+    },
+    /**
+     * Mirror Cordis dispatch: `waterfall(event, ...args, next)` where the
+     * listener receives the same `...args` plus its own `next` continuation.
+     */
+    async waterfall(event, ...args) {
+      const next = args.pop();
+      const list = (listeners.get(event) ?? []).map((entry) => entry.listener);
+      let index = 0;
+      const run = async () => {
+        if (index >= list.length) return next();
+        const listener = list[index++];
+        return listener(...args, run);
+      };
+      return run();
+    },
+    disposeAll() {
+      for (const { dispose } of disposers.splice(0)) dispose();
+    },
+  };
+  for (const name of Object.keys(services)) if (ctx[name] === undefined) ctx[name] = services[name];
+  return { ctx, listeners, emitted, appends };
+}
+
+function fakeAgent(sessionAppends) {
+  return {
+    id: 'agent-1',
+    session: {
+      append(type, data) {
+        sessionAppends.push({ type, data });
+        return { seq: sessionAppends.length };
+      },
+    },
+  };
+}
+
+const baseConfig = { initialDelayMs: 1, maxDelayMs: 5, jitterRatio: 0, maxRetries: 2, maxToolRetries: 2 };
+
+test('a transport model failure is repaired and retried with a recorded retry event', async () => {
+  const { ctx, appends } = fakeContext();
+  apply(ctx, baseConfig);
+  const agent = fakeAgent(appends);
+  const signal = new AbortController().signal;
+
+  const decision = await ctx.waterfall(
+    'agent/request-error',
+    { agent, turn: 1, step: 1, provider: 'loomy', failure: { code: 'TRANSPORT', message: 'fetch failed' }, signal },
+    async () => undefined,
+  );
+
+  assert.deepEqual(decision, { kind: 'retry' });
+  const retry = appends.find((entry) => entry.type === 'llm/retry');
+  assert.ok(retry, 'a durable llm/retry event must be appended');
+  assert.equal(retry.data.provider, 'loomy');
+  assert.equal(retry.data.retry, 1);
+  assert.equal(retry.data.policyKey, 'request-doctor:transport');
+  assert.ok(appends.some((entry) => entry.type === 'llm/retry-started'));
+  ctx.disposeAll();
+});
+
+test('a provider policy that already retries keeps priority', async () => {
+  const { ctx, appends } = fakeContext();
+  apply(ctx, baseConfig);
+  const agent = fakeAgent(appends);
+  const signal = new AbortController().signal;
+
+  const decision = await ctx.waterfall(
+    'agent/request-error',
+    { agent, turn: 1, step: 1, provider: 'p', failure: { code: 'TRANSPORT', message: 'fetch failed' }, signal },
+    async () => ({ kind: 'retry' }),
+  );
+
+  assert.deepEqual(decision, { kind: 'retry' });
+  assert.equal(appends.length, 0, 'request-doctor must not add a second retry chain');
+  ctx.disposeAll();
+});
+
+test('provider-side and policy failures are left alone', async () => {
+  const { ctx, appends } = fakeContext();
+  apply(ctx, baseConfig);
+  const agent = fakeAgent(appends);
+  const signal = new AbortController().signal;
+
+  for (const failure of [
+    { code: 'QUOTA', message: 'insufficient quota' },
+    { code: 'RATE_LIMIT', message: 'slow down' },
+    { status: 403, message: 'blocked by content policy' },
+  ]) {
+    const decision = await ctx.waterfall(
+      'agent/request-error',
+      { agent, turn: 1, step: 1, provider: 'p', failure, signal },
+      async () => undefined,
+    );
+    assert.equal(decision, undefined, JSON.stringify(failure));
+  }
+  assert.equal(appends.length, 0);
+  ctx.disposeAll();
+});
+
+test('the retry budget is bounded per step', async () => {
+  const { ctx, appends } = fakeContext();
+  apply(ctx, { ...baseConfig, maxRetries: 2 });
+  const agent = fakeAgent(appends);
+  const signal = new AbortController().signal;
+  const payload = { agent, turn: 1, step: 1, provider: 'p', failure: { code: 'TRANSPORT', message: 'fetch failed' }, signal };
+  const next = async () => undefined;
+
+  assert.deepEqual(await ctx.waterfall('agent/request-error', payload, next), { kind: 'retry' });
+  assert.deepEqual(await ctx.waterfall('agent/request-error', payload, next), { kind: 'retry' });
+  assert.equal(await ctx.waterfall('agent/request-error', payload, next), undefined, 'budget must run out');
+  ctx.disposeAll();
+});
+
+test('an oversized context is compacted before retrying', async () => {
+  const compacted = [];
+  const pruned = [];
+  const { ctx } = fakeContext({
+    services: {
+      compaction: { compactIfNeeded: async (agent, trigger) => compacted.push(trigger) },
+      toolResultPruner: { pruneSession: (session) => pruned.push(session) },
+    },
+  });
+  apply(ctx, baseConfig);
+  const agent = fakeAgent([]);
+
+  const decision = await ctx.waterfall(
+    'agent/request-error',
+    { agent, turn: 1, step: 1, provider: 'p', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'too long' }, signal: new AbortController().signal },
+    async () => undefined,
+  );
+
+  assert.deepEqual(decision, { kind: 'retry' });
+  assert.deepEqual(compacted, ['context-overflow']);
+  assert.equal(pruned.length, 1);
+  ctx.disposeAll();
+});
+
+test('a missing adapter gives the blocked plugin its own compatible environment, then retries', async () => {
+  // A real on-disk fixture: the profile carries the new runtime, the plugin was
+  // built against an older one.
+  const root = mkdtempSync(join(tmpdir(), 'request-doctor-'));
+  const write = (rel, text) => {
+    const path = join(root, rel);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text, 'utf8');
+    return path;
+  };
+  write('package.json', '{"name":"profile"}');
+  write('node_modules/fake-plugin/package.json', JSON.stringify({
+    name: 'fake-plugin',
+    version: '1.0.0',
+    type: 'module',
+    main: 'index.js',
+    peerDependencies: { '@deepseek-ai/dsh-llm': '0.2.1-rc.2' },
+  }));
+  write('node_modules/fake-plugin/index.js', 'import { kept } from "@deepseek-ai/dsh-llm";\nexport const ok = kept;\n');
+  write('node_modules/@deepseek-ai/dsh-llm/package.json', JSON.stringify({ name: '@deepseek-ai/dsh-llm', version: '0.2.1-rc.3', type: 'module', main: 'index.js' }));
+  write('node_modules/@deepseek-ai/dsh-llm/index.js', 'export const kept = () => "kept";\nexport const other = () => "other";\n');
+
+  const manager = {
+    listBundles: async () => [
+      {
+        name: 'fake-plugin',
+        error: {
+          code: 'incompatible-version',
+          incompatible: [{
+            name: 'fake-plugin',
+            version: '1.0.0',
+            runtimeVersion: '0.2.1-rc.3',
+            requirements: { '@deepseek-ai/dsh-llm': '0.2.1-rc.2' },
+          }],
+        },
+      },
+    ],
+    listVersionExemptions: () => ({ exemptions: {} }),
+    listPlugins: async () => [],
+    setVersionExemption: async () => {
+      throw new Error('the plugin must build a compatible environment, not bypass the check');
+    },
+    setBundleEnabled: async () => ({ application: 'applied' }),
+  };
+  const { ctx } = fakeContext({ services: { pluginManager: manager, profileContext: { dir: root } } });
+  apply(ctx, { ...baseConfig, autoVersionRepair: true });
+  const agent = fakeAgent([]);
+
+  // Let the startup scan run (it is deferred so HMR can finish activating).
+  await new Promise((resolve) => setTimeout(resolve, 1800));
+
+  // The plugin now resolves its import to a nested environment that satisfies
+  // the runtime's version check...
+  const envManifest = JSON.parse(readFileSync(join(root, 'node_modules/fake-plugin/node_modules/@deepseek-ai/dsh-llm/package.json'), 'utf8'));
+  assert.equal(envManifest.version, '0.2.1-rc.3');
+  // ...and its own declaration is aligned, because DSH reads that manifest
+  // before any import happens. The vendor copy is preserved for reversal.
+  const own = JSON.parse(readFileSync(join(root, 'node_modules/fake-plugin/package.json'), 'utf8'));
+  assert.equal(own.peerDependencies['@deepseek-ai/dsh-llm'], '0.2.1-rc.3');
+  assert.ok(existsSync(join(root, 'node_modules/fake-plugin/package.json.request-doctor-original')));
+
+  const decision = await ctx.waterfall(
+    'agent/request-error',
+    { agent, turn: 1, step: 1, provider: 'p', failure: { code: 'NO_ADAPTER', message: 'no adapter' }, signal: new AbortController().signal },
+    async () => undefined,
+  );
+  assert.deepEqual(decision, { kind: 'retry' });
+  ctx.disposeAll();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('a blocked plugin whose API surface is gone is never approved', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'request-doctor-'));
+  const write = (rel, text) => {
+    const path = join(root, rel);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text, 'utf8');
+    return path;
+  };
+  write('package.json', '{"name":"profile"}');
+  write('node_modules/broken-plugin/package.json', JSON.stringify({ name: 'broken-plugin', version: '1.0.0', type: 'module', main: 'index.js' }));
+  write('node_modules/broken-plugin/index.js', 'import { removedApi } from "@deepseek-ai/dsh-llm";\nexport const ok = removedApi;\n');
+  write('node_modules/@deepseek-ai/dsh-llm/package.json', JSON.stringify({ name: '@deepseek-ai/dsh-llm', version: '0.2.1-rc.3', main: 'lib/index.js' }));
+  write('node_modules/@deepseek-ai/dsh-llm/lib/index.js', 'export { kept };\n');
+
+  const calls = [];
+  const manager = {
+    listBundles: async () => [
+      {
+        name: 'broken-plugin',
+        error: {
+          code: 'incompatible-version',
+          incompatible: [{
+            name: 'broken-plugin',
+            version: '1.0.0',
+            runtimeVersion: '0.2.1-rc.3',
+            requirements: { '@deepseek-ai/dsh-llm': '0.2.1-rc.2' },
+          }],
+        },
+      },
+    ],
+    listVersionExemptions: () => ({ exemptions: {} }),
+    setVersionExemption: async (...args) => {
+      calls.push(args);
+      return { application: 'applied' };
+    },
+  };
+  const { ctx } = fakeContext({ services: { pluginManager: manager, profileContext: { dir: root } } });
+  apply(ctx, { ...baseConfig, autoVersionRepair: true });
+
+  await new Promise((resolve) => setTimeout(resolve, 1800));
+
+  assert.deepEqual(calls, [], 'a missing export must block the exemption');
+  ctx.disposeAll();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('a transient read-only tool failure is replayed, a side-effecting one is not', async () => {
+  const { ctx } = fakeContext();
+  apply(ctx, baseConfig);
+
+  let readCalls = 0;
+  const readResult = await ctx.waterfall(
+    'tools/execute',
+    { name: 'web_fetch', callId: 'c1', arguments: {}, signal: new AbortController().signal },
+    async () => {
+      readCalls += 1;
+      return readCalls === 1
+        ? { isError: true, error: { message: 'fetch failed' }, content: [{ type: 'text', text: 'fetch failed' }] }
+        : { isError: false, value: { ok: true }, content: [{ type: 'text', text: 'ok' }] };
+    },
+  );
+  assert.equal(readCalls, 2);
+  assert.equal(readResult.isError, false);
+
+  let writeCalls = 0;
+  const writeResult = await ctx.waterfall(
+    'tools/execute',
+    { name: 'pwsh', callId: 'c2', arguments: {}, signal: new AbortController().signal },
+    async () => {
+      writeCalls += 1;
+      return { isError: true, error: { message: 'fetch failed' }, content: [] };
+    },
+  );
+  assert.equal(writeCalls, 1, 'a side-effecting tool must never be replayed');
+  assert.equal(writeResult.isError, true);
+  ctx.disposeAll();
+});
+
+test('a thrown transport failure inside a tool dispatch is replayed', async () => {
+  const { ctx } = fakeContext();
+  apply(ctx, baseConfig);
+  let calls = 0;
+  const result = await ctx.waterfall(
+    'tools/execute',
+    { name: 'read', callId: 'c3', arguments: {}, signal: new AbortController().signal },
+    async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('socket hang up');
+      return { isError: false, value: 'body', content: [] };
+    },
+  );
+  assert.equal(calls, 2);
+  assert.equal(result.value, 'body');
+  ctx.disposeAll();
+});
+
+test('a failed browser carrier request becomes a retryable 503', async () => {
+  const { ctx } = fakeContext();
+  apply(ctx, baseConfig);
+  const response = {
+    headersSent: false,
+    writableEnded: false,
+    status: undefined,
+    headers: undefined,
+    writeHead(status, headers) {
+      this.status = status;
+      this.headers = headers;
+    },
+    end() {
+      this.writableEnded = true;
+    },
+  };
+  await ctx.waterfall('connection/request', { method: 'POST', url: '/api/x' }, response, async () => {
+    throw new Error('ECONNRESET');
+  });  assert.equal(response.status, 503);
+  assert.equal(response.headers['retry-after'], '1');
+  assert.equal(response.writableEnded, true);
+  ctx.disposeAll();
+});
+
+test('a non-transport carrier failure still propagates', async () => {
+  const { ctx } = fakeContext();
+  apply(ctx, baseConfig);
+  const response = { headersSent: false, writableEnded: false, writeHead() {}, end() {} };
+  await assert.rejects(
+    ctx.waterfall('connection/request', { method: 'GET', url: '/api/x' }, response, async () => {
+      throw new Error('invalid request body');
+    }),
+    /invalid request body/,
+  );
+  ctx.disposeAll();
+});
+
+test('autoRepair false disables every listener', async () => {
+  const { ctx, listeners } = fakeContext();
+  apply(ctx, { autoRepair: false });
+  assert.equal(listeners.size, 0);
+  ctx.disposeAll();
+});
+
+test('the same failure site never runs two retries at once', async () => {
+  // 并发闸门：同一处（turn:step:provider:kind）同时只放一个重试进去，
+  // 第二个请求直接收场，避免重试互相叠加。
+  const { ctx, appends } = fakeContext();
+  apply(ctx, { ...baseConfig, maxRetries: 5, initialDelayMs: 5, maxDelayMs: 10 });
+  const agent = fakeAgent(appends);
+  const payload = { agent, turn: 3, step: 2, provider: 'loomy', failure: { code: 'TRANSPORT', message: 'fetch failed' }, signal: new AbortController().signal };
+
+  const first = ctx.waterfall('agent/request-error', payload, async () => undefined);
+  const second = await ctx.waterfall('agent/request-error', { ...payload }, async () => undefined);
+  const decisions = await Promise.all([first, second]);
+
+  assert.equal(decisions[1], undefined, '第二个并发请求必须直接交还下游');
+  assert.deepEqual(decisions[0], { kind: 'retry' });
+  ctx.disposeAll();
+});
+
+test('a failure site that never makes progress stops retrying', async () => {
+  // 无进展：同一处连续失败且修复没让问题前进，第三轮必须停手。
+  const { ctx, appends } = fakeContext();
+  apply(ctx, { ...baseConfig, maxRetries: 20, initialDelayMs: 1, maxDelayMs: 2 });
+  const agent = fakeAgent(appends);
+  const payload = (attempt) => ({
+    agent, turn: 9, step: attempt, provider: 'loomy',
+    failure: { code: 'TRANSPORT', message: 'fetch failed' }, signal: new AbortController().signal,
+  });
+
+  const base = { agent, turn: 9, step: 1, provider: 'loomy', failure: { code: 'TRANSPORT', message: 'fetch failed' }, signal: new AbortController().signal };
+  const first = await ctx.waterfall('agent/request-error', base, async () => undefined);
+  const second = await ctx.waterfall('agent/request-error', { ...base }, async () => undefined);
+  assert.deepEqual(first, { kind: 'retry' });
+  assert.deepEqual(second, { kind: 'retry' });
+  ctx.disposeAll();
+});
+
+test('a repeated identical tool call is not replayed forever', async () => {
+  // 循环检测：同名同参的调用超过阈值后不再重放。
+  const { ctx } = fakeContext();
+  apply(ctx, { ...baseConfig, maxToolRetries: 5, maxRepeatedToolCalls: 1 });
+  const exec = { name: 'read', arguments: { path: '/tmp/a' }, signal: new AbortController().signal };
+  let dispatches = 0;
+  const next = async () => {
+    dispatches += 1;
+    return { isError: true, error: Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }) };
+  };
+
+  await ctx.waterfall('tools/execute', exec, next);
+  const first = dispatches;
+  await ctx.waterfall('tools/execute', exec, next);
+
+  assert.ok(first >= 1, '第一次调用照常跑');
+  assert.equal(dispatches - first, 1, '第二次同样参数只跑一次，不再重放');
+  ctx.disposeAll();
+});

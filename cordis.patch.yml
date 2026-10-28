@@ -1,0 +1,16 @@
+- insert:
+    - id: request-doctor
+      name: 'dsh-request-doctor'
+      config:
+        autoRepair: true
+        autoVersionRepair: true
+        recordRetryEvents: true
+        maxRetries: 12
+        maxToolRetries: 2
+        maxVersionRepairs: 64
+        maxAuthRetries: 2
+        maxRepeatedToolCalls: 3
+        initialDelayMs: 400
+        maxDelayMs: 20000
+        jitterRatio: 0.25
+        retryableToolPattern: '^(read|read_image|glob|grep|web_fetch|web_search|cordis_inspect_.*|browser_(list_tabs|snapshot|get_text|wait|scroll)|db_(query|preview|describe_table|list_tables))$'
