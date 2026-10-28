@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "title": "Request Doctor",
+    "description": "Automatically repairs request failures caused by the local client (transport, timeout, oversized context, missing adapter) and resolves plugin/DSH version mismatches that block installed bundles."
+  },
+  "tabLabel": "Incompatible install",
+  "intro": "These plugins are refused by the running DSH version. Installing one takes a single step: grant the version exemption the manager asks for, then let it install. Declaration alignment and the compatibility environment are filled in afterwards, so what runs is the current implementation and what the manifest says is the current version.",
+  "placeholder": "package@version, e.g. dsh-ssh-ops@0.4.0",
+  "installTyped": "Allow and install",
+  "fixAndInstall": "Allow and install",
+  "requires": "Asks to run on {{runtime}}",
+  "none": "Nothing is being refused right now.",
+  "working": "Working on {{target}}…",
+  "installDone": "{{target}} installed; the compatibility environment follows in the background.",
+  "installFailed": "Could not install: {{reason}}",
+  "listFailed": "Could not read the plugin list."
+}

@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "title": "请求急救员",
+    "description": "自动修复由本机客户端造成的请求失败（传输中断、超时、上下文超限、适配器缺失），并自动解决插件与 DSH 版本不一致导致无法加载的问题。"
+  },
+  "tabLabel": "不兼容安装",
+  "intro": "下面是被当前 DSH 版本拒装的插件。装它们只需要一步：先按管理器的规则授权这个版本，再让它自己装。装完之后，声明对齐和兼容环境会自动补上——跑的是当前实现，声明说的也是当前版本。",
+  "placeholder": "包名@版本，例如 dsh-ssh-ops@0.4.0",
+  "installTyped": "授权并安装",
+  "fixAndInstall": "授权并安装",
+  "requires": "要求运行在 {{runtime}}",
+  "none": "当前没有被拒装的插件。",
+  "working": "正在处理 {{target}}…",
+  "installDone": "{{target}} 已装好，兼容环境会在后台补上。",
+  "installFailed": "没能装上：{{reason}}",
+  "listFailed": "读不到插件列表。"
+}

@@ -1,0 +1,27 @@
+{
+  "standard": "GB/T 45717-2025 信息技术 软件测量 软件质量测量 自动化的源代码质量测度",
+  "generatedAt": "2026-10-28T11:33:25.565Z",
+  "scope": {
+    "files": 26,
+    "totalLines": 4831,
+    "sourceLines": 3527,
+    "commentLines": 862
+  },
+  "measures": {
+    "commentDensity": 24.44,
+    "duplicationPercent": 4.82,
+    "functionCount": 361,
+    "maxComplexity": 10,
+    "maxFunctionLines": 59,
+    "maxFileLines": 496,
+    "averageComplexity": 3.86
+  },
+  "limits": {
+    "maxComplexity": 10,
+    "maxFunctionLines": 60,
+    "maxFileLines": 500,
+    "minCommentDensity": 10,
+    "maxDuplicationPercent": 5
+  },
+  "violations": []
+}
